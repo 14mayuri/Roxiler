@@ -1,0 +1,476 @@
+1. Project Setup: 
+npm install express mongoose axios cors dotenv
+2. File Structure: 
+roxiler-dashboard/
+├── .env
+├── server.js
+├── models/
+│   └── Product.js
+
+3. .env file: 
+MONGO_URI=mongodb://localhost:27017/roxiler_db
+PORT=5000
+THIRD_PARTY_API_URL=https://s3.amazonaws.com/roxiler.com/product_transaction.json
+
+4. models/Product.js: 
+// models/Product.js
+const mongoose = require('mongoose');
+
+const productSchema = new mongoose.Schema({
+    id: { type: Number, unique: true, required: true },
+    title: String,
+    description: String,
+    price: Number,
+    category: String,
+    image: String,
+    sold: Boolean,
+    dateOfSale: Date,
+});
+
+module.exports = mongoose.model('Product', productSchema);
+
+5. server.js:
+// server.js
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const axios = require('axios');
+const cors = require('cors');
+
+const Product = require('./models/Product');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const THIRD_PARTY_API_URL = process.env.THIRD_PARTY_API_URL;
+
+app.use(express.json());
+app.use(cors());
+
+// --- MongoDB Connection ---
+mongoose.connect(process.env.MONGO_URI)
+    .then(() => console.log('MongoDB Connected!'))
+    .catch(err => console.error('MongoDB connection error:', err));
+
+//function to get month number
+const getMonthNumber = (monthName) => {
+    const months = {
+        january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+        july: 7, august: 8, september: 9, october: 10, november: 11, december: 12
+    };
+    return months[monthName.toLowerCase()];
+};
+
+// Common function to get month match condition
+const getMonthMatchCondition = (monthNum) => ({
+    $expr: { $eq: [{ $month: '$dateOfSale' }, monthNum] }
+});
+
+// 1. Initialize Database API
+app.get('/api/initialize-database', async (req, res) => {
+    try {
+        await Product.deleteMany({}); // Clear existing data
+        const response = await axios.get(THIRD_PARTY_API_URL);
+        await Product.insertMany(response.data);
+        res.status(200).send('Database initialized successfully!');
+    } catch (error) {
+        console.error('Error initializing database:', error);
+        res.status(500).send('Failed to initialize database.');
+    }
+});
+
+// 2. List All Transactions API
+app.get('/api/transactions', async (req, res) => {
+    const { month, search = '', page = 1, perPage = 10 } = req.query;
+    const pageNum = parseInt(page);
+    const limit = parseInt(perPage);
+    const skip = (pageNum - 1) * limit;
+
+    let query = {};
+    const monthNum = getMonthNumber(month);
+    if (monthNum) {
+        query.$expr = { $eq: [{ $month: '$dateOfSale' }, monthNum] };
+    }
+
+    if (search) {
+        const searchRegex = new RegExp(search, 'i');
+        query.$or = [
+            { title: { $regex: searchRegex } },
+            { description: { $regex: searchRegex } },
+            // If search term is a valid number, also search by price
+            ...(parseFloat(search) ? [{ price: parseFloat(search) }] : [])
+        ];
+    }
+
+    try {
+        const transactions = await Product.find(query).skip(skip).limit(limit);
+        const totalTransactions = await Product.countDocuments(query);
+        res.json({
+            transactions,
+            currentPage: pageNum,
+            perPage: limit,
+            totalPages: Math.ceil(totalTransactions / limit),
+            totalItems: totalTransactions
+        });
+    } catch (error) {
+        console.error('Error fetching transactions:', error);
+        res.status(500).send('Error fetching transactions.');
+    }
+});
+
+app.get('/api/statistics', async (req, res) => {
+    const { month } = req.query;
+    const monthNum = getMonthNumber(month);
+    if (!monthNum) return res.status(400).send('Invalid month name.');
+
+    try {
+        const stats = await Product.aggregate([
+            { $match: getMonthMatchCondition(monthNum) },
+            {
+                $group: {
+                    _id: null,
+                    totalSaleAmount: { $sum: { $cond: [{ $eq: ['$sold', true] }, '$price', 0] } },
+                    totalSoldItems: { $sum: { $cond: [{ $eq: ['$sold', true] }, 1, 0] } },
+                    totalNotSoldItems: { $sum: { $cond: [{ $eq: ['$sold', false] }, 1, 0] } }
+                }
+            },
+            { $project: { _id: 0, totalSaleAmount: 1, totalSoldItems: 1, totalNotSoldItems: 1 } }
+        ]);
+        res.json(stats.length > 0 ? stats[0] : { totalSaleAmount: 0, totalSoldItems: 0, totalNotSoldItems: 0 });
+    } catch (error) {
+        console.error('Error fetching statistics:', error);
+        res.status(500).send('Error fetching statistics.');
+    }
+});
+
+app.get('/api/bar-chart', async (req, res) => {
+    const { month } = req.query;
+    const monthNum = getMonthNumber(month);
+    if (!monthNum) return res.status(400).send('Invalid month name.');
+
+    const priceRanges = [
+        { range: '0-100', min: 0, max: 100 }, { range: '101-200', min: 101, max: 200 },
+        { range: '201-300', min: 201, max: 300 }, { range: '301-400', min: 301, max: 400 },
+        { range: '401-500', min: 401, max: 500 }, { range: '501-600', min: 501, max: 600 },
+        { range: '601-700', min: 601, max: 700 }, { range: '701-800', min: 701, max: 800 },
+        { range: '801-900', min: 801, max: 900 }, { range: '901-above', min: 901, max: Infinity }
+    ];
+
+    try {
+        const products = await Product.find(getMonthMatchCondition(monthNum));
+        const result = priceRanges.map(r => ({ range: r.range, count: 0 }));
+
+        products.forEach(p => {
+            const rangeIndex = priceRanges.findIndex(r => p.price >= r.min && p.price <= r.max);
+            if (rangeIndex !== -1) result[rangeIndex].count++;
+        });
+        res.json(result);
+    } catch (error) {
+        console.error('Error fetching bar chart data:', error);
+        res.status(500).send('Error fetching bar chart data.');
+    }
+});
+
+// 5. Pie Chart API
+app.get('/api/pie-chart', async (req, res) => {
+    const { month } = req.query;
+    const monthNum = getMonthNumber(month);
+    if (!monthNum) return res.status(400).send('Invalid month name.');
+
+    try {
+        const categories = await Product.aggregate([
+            { $match: getMonthMatchCondition(monthNum) },
+            { $group: { _id: '$category', itemCount: { $sum: 1 } } },
+            { $project: { _id: 0, category: '$_id', itemCount: 1 } }
+        ]);
+        res.json(categories);
+    } catch (error) {
+        console.error('Error fetching pie chart data:', error);
+        res.status(500).send('Error fetching pie chart data.');
+    }
+});
+
+// 6. Combined API
+app.get('/api/combined-data', async (req, res) => {
+    const { month } = req.query;
+    if (!month) return res.status(400).send('Month is required.');
+
+    try {
+        // Using Promise.all to fetch all data concurrently
+        const [statisticsRes, barChartRes, pieChartRes] = await Promise.all([
+            axios.get(`http://localhost:${PORT}/api/statistics?month=${month}`),
+            axios.get(`http://localhost:${PORT}/api/bar-chart?month=${month}`),
+            axios.get(`http://localhost:${PORT}/api/pie-chart?month=${month}`)
+        ]);
+
+        res.json({
+            statistics: statisticsRes.data,
+            barChart: barChartRes.data,
+            pieChart: pieChartRes.data
+        });
+    } catch (error) {
+        console.error('Error fetching combined data:', error.message);
+        res.status(500).send('Error fetching combined data.');
+    }
+});
+
+// Start the server
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
+
+Part 2: Frontend (React.js)
+1. Project Setup: (Same as before)
+npx create-react-app client
+cd client
+npm install axios react-chartjs-2 chart.js
+2. File Structure: (Same as before)
+roxiler-dashboard/
+└── client/
+    ├── public/
+    ├── src/
+    │   ├── App.js
+    │   ├── index.js
+    │   ├── styles.css
+    │   ├── components/
+    │       ├── TransactionTable.js
+    │       ├── StatisticsBox.js
+    │       ├── BarChartDisplay.js
+    │       └── PieChartDisplay.js
+
+3. client/src/styles.css: 
+4. client/src/components/TransactionTable.js: 
+// client/src/components/TransactionTable.js
+import React from 'react';
+
+function TransactionTable({ transactions, currentPage, totalPages, handleNext, handlePrevious }) {
+    return (
+        <div>
+            <h2>Transactions Table</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th><th>Title</th><th>Description</th><th>Price</th>
+                        <th>Category</th><th>Sold</th><th>Image</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {transactions.map(t => (
+                        <tr key={t.id}>
+                            <td>{t.id}</td><td>{t.title}</td><td>{t.description}</td><td>${t.price?.toFixed(2)}</td>
+                            <td>{t.category}</td><td>{t.sold ? 'Yes' : 'No'}</td>
+                            <td><img src={t.image} alt={t.title} /></td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+            <div className="pagination">
+                <button onClick={handlePrevious} disabled={currentPage === 1}>Previous</button>
+                <span>Page No: {currentPage} / {totalPages}</span>
+                <button onClick={handleNext} disabled={currentPage === totalPages}>Next</button>
+            </div>
+        </div>
+    );
+}
+export default TransactionTable;
+
+5. client/src/components/StatisticsBox.js: 
+// client/src/components/StatisticsBox.js
+import React from 'react';
+
+function StatisticsBox({ statistics, selectedMonth }) {
+    return (
+        <div className="statistics-box">
+            <h2>Statistics - {selectedMonth}</h2>
+            <div><span>Total Sale Amount:</span> <strong>${statistics.totalSaleAmount?.toFixed(2) || '0.00'}</strong></div>
+            <div><span>Total Sold Items:</span> <strong>{statistics.totalSoldItems || 0}</strong></div>
+            <div><span>Total Not Sold Items:</span> <strong>{statistics.totalNotSoldItems || 0}</strong></div>
+        </div>
+    );
+}
+export default StatisticsBox;
+
+6. client/src/components/BarChartDisplay.js: 
+// client/src/components/BarChartDisplay.js
+import React from 'react';
+import { Bar } from 'react-chartjs-2';
+import { Chart as ChartJS, CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend } from 'chart.js';
+
+ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend);
+
+function BarChartDisplay({ barChartData, selectedMonth }) {
+    const data = {
+        labels: barChartData.map(item => item.range),
+        datasets: [{
+            label: 'Number of Items',
+            data: barChartData.map(item => item.count),
+            backgroundColor: 'rgba(75, 192, 192, 0.6)',
+            borderColor: 'rgba(75, 192, 192, 1)',
+            borderWidth: 1,
+        }],
+    };
+    const options = {
+        responsive: true,
+        plugins: { legend: { position: 'top' }, title: { display: true, text: `Bar Chart Stats - ${selectedMonth}` } },
+        scales: { x: { title: { display: true, text: 'Price Range' } }, y: { title: { display: true, text: 'Number of Items' }, beginAtZero: true } },
+    };
+    return (<div className="chart-card"><Bar data={data} options={options} /></div>);
+}
+export default BarChartDisplay;
+
+7. client/src/components/PieChartDisplay.js: 
+// client/src/components/PieChartDisplay.js
+import React from 'react';
+import { Pie } from 'react-chartjs-2';
+import { Chart as ChartJS, ArcElement, Tooltip, Legend } from 'chart.js';
+
+ChartJS.register(ArcElement, Tooltip, Legend);
+
+function PieChartDisplay({ pieChartData, selectedMonth }) {
+    const data = {
+        labels: pieChartData.map(item => item.category),
+        datasets: [{
+            label: 'Number of Items',
+            data: pieChartData.map(item => item.itemCount),
+            backgroundColor: [
+                'rgba(255, 99, 132, 0.6)', 'rgba(54, 162, 235, 0.6)', 'rgba(255, 206, 86, 0.6)',
+                'rgba(75, 192, 192, 0.6)', 'rgba(153, 102, 255, 0.6)', 'rgba(255, 159, 64, 0.6)',
+                'rgba(199, 199, 199, 0.6)',
+            ],
+            borderColor: [
+                'rgba(255, 99, 132, 1)', 'rgba(54, 162, 235, 1)', 'rgba(255, 206, 86, 1)',
+                'rgba(75, 192, 192, 1)', 'rgba(153, 102, 255, 1)', 'rgba(255, 159, 64, 1)',
+                'rgba(199, 199, 199, 1)',
+            ],
+            borderWidth: 1,
+        }],
+    };
+    const options = { responsive: true, plugins: { legend: { position: 'top' }, title: { display: true, text: `Pie Chart Stats - ${selectedMonth}` } } };
+    return (<div className="chart-card"><Pie data={data} options={options} /></div>);
+}
+export default PieChartDisplay;
+
+8. client/src/App.js (Shortened Main React App Component):
+// client/src/App.js
+import React, { useState, useEffect, useCallback } from 'react';
+import axios from 'axios';
+import TransactionTable from './components/TransactionTable';
+import StatisticsBox from './components/StatisticsBox';
+import BarChartDisplay from './components/BarChartDisplay';
+import PieChartDisplay from './components/PieChartDisplay';
+import './styles.css';
+
+const API_BASE_URL = 'http://localhost:5000/api';
+
+function App() {
+    const [transactions, setTransactions] = useState([]);
+    const [statistics, setStatistics] = useState({});
+    const [barChartData, setBarChartData] = useState([]);
+    const [pieChartData, setPieChartData] = useState([]);
+    const [selectedMonth, setSelectedMonth] = useState('March');
+    const [searchQuery, setSearchQuery] = useState('');
+    const [currentPage, setCurrentPage] = useState(1);
+    const [totalPages, setTotalPages] = useState(1);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState(null);
+
+    const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+    // Fetches transactions based on current state
+    const fetchTransactions = useCallback(async () => {
+        setLoading(true); setError(null);
+        try {
+            const res = await axios.get(`${API_BASE_URL}/transactions`, {
+                params: { month: selectedMonth, search: searchQuery, page: currentPage, perPage: 10 },
+            });
+            setTransactions(res.data.transactions);
+            setTotalPages(res.data.totalPages);
+        } catch (err) {
+            console.error('Error fetching transactions:', err);
+            setError('Failed to load transactions.');
+        } finally {
+            setLoading(false);
+        }
+    }, [selectedMonth, searchQuery, currentPage]);
+
+    // Fetches combined statistics, bar, and pie chart data
+    const fetchCombinedData = useCallback(async () => {
+        try {
+            const res = await axios.get(`${API_BASE_URL}/combined-data`, { params: { month: selectedMonth } });
+            setStatistics(res.data.statistics);
+            setBarChartData(res.data.barChart);
+            setPieChartData(res.data.pieChart);
+        } catch (err) {
+            console.error('Error fetching combined data:', err);
+        }
+    }, [selectedMonth]);
+
+      useEffect(() => {
+        fetchTransactions();
+    }, [fetchTransactions]);
+
+    useEffect(() => {
+        fetchCombinedData();
+    }, [fetchCombinedData]);
+
+    const handleMonthChange = (e) => {
+        setSelectedMonth(e.target.value);
+        setCurrentPage(1); // Reset page
+    };
+
+    useEffect(() => {
+        const handler = setTimeout(() => {
+            setCurrentPage(1); // Reset to first page
+            fetchTransactions();
+        }, 300);
+        return () => clearTimeout(handler);
+    }, [searchQuery, fetchTransactions]);
+
+    const handleSearchChange = (e) => {
+        setSearchQuery(e.target.value);
+        if (e.target.value === '') setCurrentPage(1);
+    };
+
+    const handleNextPage = () => currentPage < totalPages && setCurrentPage(p => p + 1);
+    const handlePreviousPage = () => currentPage > 1 && setCurrentPage(p => p - 1);
+
+    return (
+        <div className="dashboard-container">
+            <h1>Transaction Dashboard</h1>
+            <div className="controls">
+                <div>
+                    <label htmlFor="month-select">Select Month:</label>
+                    <select id="month-select" value={selectedMonth} onChange={handleMonthChange}>
+                        {months.map(month => (<option key={month} value={month}>{month}</option>))}
+                    </select>
+                </div>
+                <div>
+                    <label htmlFor="search-input">Search Transaction:</label>
+                    <input
+                        type="text"
+                        id="search-input"
+                        placeholder="Search by title, description, price..."
+                        value={searchQuery}
+                        onChange={handleSearchChange}
+                    />
+                </div>
+            </div>
+
+            {loading && <p>Loading data...</p>}
+            {error && <p style={{ color: 'red' }}>Error: {error}</p>}
+
+            {!loading && !error && (
+                <>
+                    <TransactionTable
+                        transactions={transactions} currentPage={currentPage}
+                        totalPages={totalPages} handleNext={handleNextPage} handlePrevious={handlePreviousPage}
+                    />
+                    <StatisticsBox statistics={statistics} selectedMonth={selectedMonth} />
+                    <div className="charts-container">
+                        <BarChartDisplay barChartData={barChartData} selectedMonth={selectedMonth} />
+                        <PieChartDisplay pieChartData={pieChartData} selectedMonth={selectedMonth} />
+                    </div>
+                </>
+            )}
+        </div>
+    );
+}
